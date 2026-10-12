@@ -291,6 +291,89 @@ $training
 <footer><span>Obelisk $version</span><span>$created</span></footer>
 </div></body></html>"""
 
+def profile_text(result, width=78):
+    """The report produced by comparing two recorded profiles."""
+    L = []
+    g = result["grade"]["grade"]
+    L.append("=" * width)
+    L.append("  DEVICE PROFILE COMPARISON".ljust(width - 10) + ("GRADE  %s" % g))
+    L.append("=" * width)
+    L.append("  reference   %s" % result["reference"])
+    L.append("  target      %s" % result["target"])
+    L.append("")
+    L.append("  " + SUMMARY.get(g, ""))
+    L.append("")
+    L.append("  Neither device was present. Both were measured once and compared")
+    L.append("  from the files those measurements produced.")
+    L.append("")
+
+    cov = result.get("coverage") or {}
+    L.append("-" * width)
+    L.append("  OPERATOR COVERAGE  (%d operators run on both)" % cov.get("compared", 0))
+    L.append("   %-34s %d" % ("behave the same", cov.get("unchanged", 0)))
+    L.append("   %-34s %d" % ("numerically different", len(cov.get("numerically_different", []))))
+    L.append("   %-34s %d  (%d distinct operations)"
+             % ("unavailable on the target", len(cov.get("unavailable_on_target", [])),
+                len(cov.get("distinct_unavailable", []))))
+    if cov.get("better_on_target"):
+        L.append("   %-34s %d" % ("only available on the target", len(cov["better_on_target"])))
+    L.append("")
+
+    lost = cov.get("distinct_unavailable") or []
+    if lost:
+        L.append("  WORKS ON THE REFERENCE, NOT ON THE TARGET")
+        for i in range(0, min(len(lost), 72), 4):
+            L.append("   x  " + "".join("%-18s" % n for n in lost[i:i + 4]))
+        if len(lost) > 72:
+            L.append("      and %d more" % (len(lost) - 72))
+        L.append("")
+
+    deg = cov.get("numerically_different") or []
+    if deg:
+        L.append("  RUNS ON BOTH, RETURNS A DIFFERENT ANSWER")
+        for row in deg[:20]:
+            err = ("%.2e" % row["error"]) if row.get("error") else ""
+            L.append("   !  %-34s %-10s %s" % (row["op"], row["target"], err))
+        if len(deg) > 20:
+            L.append("      and %d more" % (len(deg) - 20))
+        L.append("")
+
+    dt = result.get("dtypes") or []
+    if dt:
+        L.append("-" * width)
+        L.append("  DATA TYPES THE TARGET CANNOT COMPUTE WITH")
+        for row in dt:
+            L.append("   %-14s %s" % (row["dtype"], ", ".join(row["unsupported"])))
+        L.append("")
+
+    probes = result.get("probes") or {}
+    broken = {pid: rec for pid, rec in probes.items()
+              if rec.get("verdict") in ("DIVERGENT", "ERROR", "NAN", "INF",
+                                        "SHAPE", "NOT_BITWISE", "MISSING")}
+    if broken:
+        L.append("-" * width)
+        L.append("  ASSUMPTIONS THAT DO NOT HOLD")
+        for pid, rec in sorted(broken.items()):
+            line = "   %s  %-26s %s" % (_verdict_mark(rec.get("verdict")), pid,
+                                        rec.get("verdict"))
+            if rec.get("scaled_diff") is not None:
+                line += "  %.2e" % rec["scaled_diff"]
+            L.append(line)
+            for seg in _wrap(rec.get("symptom") or "", width - 10):
+                L.append("        %s" % seg)
+        L.append("")
+
+    L.append("-" * width)
+    L.append("  WHAT DROVE THE GRADE")
+    for r in result["grade"]["reasons"][:8]:
+        L.append("   [%s] %s" % (r["grade"], r["reason"]))
+    L.append("")
+    L.append("  reference digest  %s" % (result.get("reference_digest") or "?"))
+    L.append("  target digest     %s" % (result.get("target_digest") or "?"))
+    L.append("=" * width)
+    return "\n".join(L)
+
+
 def save_json(result, path):
     with open(path, "w") as fh:
         json.dump(result, fh, indent=1)

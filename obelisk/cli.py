@@ -258,6 +258,87 @@ def cmd_probes(args):
     return 0
 
 
+# ------------------------------------------------------------------ dump
+
+def cmd_dump(args):
+    """Record everything measurable about one device."""
+    from . import backend as B, coverage, obl, probes, workload
+
+    be = B.pick(args.backend)
+    info = be.info()
+    _p("")
+    _p("  PROFILING  %s  (%s)" % (info.get("name"), be.device))
+    _p("")
+
+    payload = {}
+
+    _p("  dtypes")
+    payload["dtypes"] = coverage.dtype_matrix(be)
+    usable = [k for k, v in payload["dtypes"].items() if v.get("matmul")]
+    _p("    %d of %d dtypes can do arithmetic here" %
+       (len(usable), len(payload["dtypes"])))
+
+    _p("  operators")
+
+    def progress(i, total):
+        _p("    %d / %d" % (i, total))
+
+    cov = coverage.sweep(be, limit=args.limit, verbose=args.verbose,
+                         progress=progress if not args.quiet else None)
+    payload["coverage"] = cov
+    c = cov["counts"]
+    _p("    %d callables discovered, %d exercised, %d not applicable"
+       % (cov["candidates"], c["tested"], c["skipped"]))
+    _p("    %d exact   %d close   %d different   %d missing   %d failing"
+       % (c["exact"], c["close"], c["mismatch"], c["missing"], c["error"]))
+
+    if not args.no_probes:
+        _p("  probes")
+        payload["probes"] = probes.run_all(be, verbose=False)
+        _p("    %d assumptions measured" % len(payload["probes"]))
+
+    if not args.no_trace:
+        _p("  forward trace")
+        payload["trace"] = workload.forward_trace(be)
+        _p("    %d layers captured" % len(payload["trace"]["order"]))
+
+    blueprint = obl.new("profile", info, payload)
+    path = obl.save(blueprint, args.out)
+    size = os.path.getsize(path) / 1024.0
+    _p("")
+    _p("  profile written to %s  (%.0f KB)" % (path, size))
+    _p("  digest %s" % blueprint["digest"])
+    _p("")
+    return 0
+
+
+# ------------------------------------------------------------------ diff
+
+def cmd_diff(args):
+    """Compare two recorded profiles with no hardware present."""
+    from . import obl, profile, report
+
+    ref = obl.load(args.reference)
+    got = obl.load(args.target)
+
+    for name, bp in (("reference", ref), ("target", got)):
+        ok = obl.verify_digest(bp)
+        if ok is False:
+            _p("  the %s profile does not match its own digest; it has been "
+               "altered since it was written" % name)
+            return 2
+
+    result = profile.compare_profiles(ref, got, args.tol)
+    _p("")
+    _p(report.profile_text(result))
+
+    if args.out:
+        report.save_json(result, args.out)
+        _p("")
+        _p("  written to %s" % args.out)
+    return 0
+
+
 # ------------------------------------------------------------------ sample
 
 def cmd_sample(args):
@@ -353,6 +434,23 @@ def build_parser():
     p.add_argument("--out", help="write the full result as JSON")
     p.add_argument("--html", help="write the report as a web page")
     p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("dump", help="record everything measurable about this device")
+    p.add_argument("--backend", default="auto")
+    p.add_argument("--out", default="device.obl")
+    p.add_argument("--limit", type=int, default=None, help="stop after N operators")
+    p.add_argument("--no-probes", action="store_true")
+    p.add_argument("--no-trace", action="store_true")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_dump)
+
+    p = sub.add_parser("diff", help="compare two recorded profiles, no hardware needed")
+    p.add_argument("reference")
+    p.add_argument("target")
+    p.add_argument("--tol", type=float, default=None)
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_diff)
 
     p = sub.add_parser("sample", help="print a few numbers; run it on two machines")
     p.add_argument("--backend", default="auto")

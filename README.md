@@ -73,6 +73,54 @@ compared against the same product computed exactly in float64 on the CPU, a
 yardstick that belongs to neither of them, so each one's precision can be stated
 on its own terms.
 
+## The whole device, not just the fifteen questions
+
+`obe record` measures the assumptions a workload depends on. `obe dump` measures
+the device itself: every operator PyTorch exposes, every data type, and the
+probes. The method rests on one decision. The CPU is the oracle for whether a
+call is *valid*, and the device is the subject. Every case runs on the CPU first;
+if it fails there, the harness called it wrong and the case is discarded rather
+than counted against the device. Only a call the CPU accepts and the device
+refuses is a finding.
+
+```
+obe dump --out card.obl        # on each card, once
+obe diff a.obl b.obl           # anywhere, with no hardware present
+```
+
+Measured on an RTX 4090 against a Moore Threads MTT S4000, both on torch 2.2.0.
+Seven hundred callables discovered, 399 valid on the CPU and run on both:
+
+```
+  OPERATOR COVERAGE  (399 operators run on both)
+   behave the same                    272
+   numerically different              20
+   unavailable on the target          105  (73 distinct operations)
+
+  WORKS ON THE REFERENCE, NOT ON THE TARGET
+   x  std      median    svd       qr        cholesky  det       logdet
+   x  asin     asinh     acosh     atanh     sinh      cosh      log1p
+   x  lgamma   digamma   erfc      exp2      hypot     nansum    kthvalue
+      and 52 more
+
+  RUNS ON BOTH, RETURNS A DIFFERENT ANSWER
+   !  torch.selu                         MISMATCH   4.83e-02
+   !  torch.vander                       MISMATCH   1.00e+00
+   !  torch.max_pool1d_with_indices      SHAPE
+```
+
+SELU multiplies positive inputs by 1.0507. On that card it returns them
+unchanged, so every positive activation is five percent low, the negative branch
+is correct, and nothing raises. A model built on it trains, converges, and is
+wrong. That is the case no amount of running the program would have found.
+
+Each profile carries a digest over everything it asserts, and a comparison cites
+the digests it was built from, so a report can be checked against the
+measurements it came from and a withdrawn measurement can be named exactly.
+
+Profiles accumulate. Ten cards is ten hardware sessions and forty-five pairings,
+and every pairing after the first is a file read.
+
 ## What it checks
 
 Fifteen probes, each isolating one assumption that programs make about their
@@ -109,6 +157,20 @@ diverging* rather than a wall of numbers.
 | **C** | at least one assumption is broken; usable with care |
 | **D** | a critical assumption is broken, or an operation is missing |
 | **E** | the device does not agree with itself |
+
+## Commands
+
+| | |
+|---|---|
+| `obe sample` | print a few numbers; run it on two machines and read them side by side |
+| `obe dump` | profile this device completely: operators, dtypes, probes |
+| `obe diff a.obl b.obl` | compare two profiles with no hardware present |
+| `obe record` | measure the reference for one workload |
+| `obe verify --ref` | compare this device against a recorded reference |
+| `obe inspect` | read a repository and predict its risk, before any card exists |
+| `obe migrate` | rewrite for another backend, and report what it could not change |
+| `obe probes` | list the assumptions Obelisk knows how to test |
+| `obe devices` | list the accelerators visible here |
 
 A grade is never the whole answer, and the report says what drove it.
 
