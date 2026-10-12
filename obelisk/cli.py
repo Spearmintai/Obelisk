@@ -1,0 +1,389 @@
+"""obe - the command line."""
+
+import argparse
+import datetime
+import json
+import os
+import sys
+
+from . import __version__
+
+
+def _p(msg=""):
+    print(msg)
+    sys.stdout.flush()
+
+
+# ------------------------------------------------------------------ devices
+
+def cmd_devices(args):
+    from . import backend as B
+    found = B.available()
+    if not found:
+        _p("torch is not installed in this interpreter")
+        return 1
+    _p("%d backend(s) available here" % len(found))
+    for b in found:
+        info = b.info()
+        _p("")
+        _p("  %s" % info.get("device"))
+        for k in ("name", "memory_gb", "capability", "multiprocessors", "backend",
+                  "runtime_version", "driver", "torch", "arch", "host",
+                  "allow_tf32_matmul"):
+            if info.get(k) is not None:
+                _p("    %-18s %s" % (k, info[k]))
+    return 0
+
+
+# ------------------------------------------------------------------ inspect
+
+def cmd_inspect(args):
+    from . import inspect as I
+    result = I.scan(args.path)
+    rows = I.summarise(result)
+    risk = I.predicted_risk(rows)
+
+    _p("")
+    _p("  PRE-FLIGHT INSPECTION   %s" % result["root"])
+    _p("  %d files read, %d assumptions found" % (result["files_scanned"], len(result["findings"])))
+    _p("")
+    _p("  PREDICTED RISK   %s   %s" % (risk["grade"], risk["why"]))
+    _p("")
+    if rows:
+        _p("  %-22s %-9s %5s  %s" % ("rule", "severity", "count", "where"))
+        _p("  " + "-" * 74)
+        for r in rows:
+            _p("  %-22s %-9s %5d  %s" % (r["rule"], r["severity"], r["count"],
+                                         ", ".join(r["examples"][:2])))
+        _p("")
+        _p("  what these mean")
+        seen = set()
+        for r in rows:
+            if r["severity"] in ("critical", "high") and r["meaning"] not in seen:
+                seen.add(r["meaning"])
+                _p("    %-22s %s" % (r["rule"], r["meaning"]))
+    _p("")
+
+    if args.out:
+        payload = {"summary": rows, "risk": risk,
+                   "files_scanned": result["files_scanned"],
+                   "findings": result["findings"] if args.full else result["findings"][:200],
+                   "root": result["root"]}
+        with open(args.out, "w") as fh:
+            json.dump(payload, fh, indent=1)
+        _p("  written to %s" % args.out)
+    return 0
+
+
+# ------------------------------------------------------------------ migrate
+
+def cmd_migrate(args):
+    from . import migrate as M
+    result = M.plan(args.path, target=args.target, apply=args.apply)
+    _p("")
+    _p("  MIGRATION PLAN   %s  ->  %s" % (args.path, args.target))
+    _p("  %d file(s) would change" % result["files_changed"]
+       if not args.apply else "  %d file(s) changed" % result["files_changed"])
+    for c in result["changes"]:
+        _p("    %-42s %d" % (c["change"], c["count"]))
+    if result["blockers"]:
+        _p("")
+        _p("  a mechanical rewrite is not enough here")
+        for b in result["blockers"][:20]:
+            _p("    %-50s %s" % (b["file"][:50], b["needs"]))
+    if result.get("leftovers"):
+        _p("")
+        _p("  still naming the old backend after the rewrite (%d place(s))"
+           % len(result["leftovers"]))
+        for lo in result["leftovers"][:12]:
+            _p("    %-28s %s" % ("%s:%d" % (lo["file"][:22], lo["line"]), lo["text"][:44]))
+    _p("")
+    if args.patch:
+        with open(args.patch, "w") as fh:
+            fh.write(result["patch"])
+        _p("  patch written to %s" % args.patch)
+    return 0
+
+
+# ------------------------------------------------------------------ record
+
+def cmd_record(args):
+    from . import backend as B, obl, probes, workload
+
+    be = B.pick(args.backend)
+    info = be.info()
+    _p("")
+    _p("  RECORDING REFERENCE on %s  (%s)" % (info.get("name"), be.device))
+    _p("")
+
+    _p("  probes")
+    probe_results = probes.run_all(be, only=args.only, verbose=True)
+
+    payload = {"probes": probe_results}
+
+    if not args.no_trace:
+        _p("  forward trace")
+        payload["trace"] = workload.forward_trace(be, dim=args.dim, layers=args.layers)
+        _p("    %d layers captured" % len(payload["trace"]["order"]))
+
+    if args.steps:
+        _p("  training %d steps" % args.steps)
+        payload["train"] = workload.train_trace(be, steps=args.steps,
+                                                dim=args.dim, layers=args.layers)
+        _p("    loss %.6f -> %.6f" % (payload["train"]["losses"][0],
+                                      payload["train"]["losses"][-1]))
+
+    blueprint = obl.new("reference", info, payload)
+    path = obl.save(blueprint, args.out)
+    size = os.path.getsize(path) / 1024.0
+    _p("")
+    _p("  blueprint written to %s  (%.0f KB)" % (path, size))
+    _p("  carry this file to the target machine; it needs nothing else.")
+    _p("")
+    return 0
+
+
+# ------------------------------------------------------------------ verify
+
+def cmd_verify(args):
+    from . import backend as B, compare, obl, probes, report, workload
+
+    ref = obl.load(args.ref)
+    be = B.pick(args.backend)
+    info = be.info()
+
+    _p("")
+    _p("  VERIFYING  %s" % info.get("name"))
+    _p("  against    %s" % obl.describe(ref))
+    _p("")
+
+    ref_payload = ref["payload"]
+    _p("  probes")
+    got_probes = probes.run_all(be, only=args.only, verbose=True)
+
+    probe_results = compare.compare_probes(ref_payload.get("probes", {}), got_probes, args.tol)
+    internal = compare.check_internal(got_probes)
+
+    layer_rows = []
+    attribution = []
+    if ref_payload.get("trace") and not args.no_trace:
+        _p("  forward trace")
+        got_trace = workload.forward_trace(be, dim=args.dim, layers=args.layers)
+        layer_rows = compare.compare_layers(ref_payload["trace"], got_trace, args.tol)
+        attribution = compare.attribute(layer_rows, probe_results)
+        _p("    %d layers compared" % len(layer_rows))
+
+    train_cmp = None
+    if ref_payload.get("train") and args.steps:
+        _p("  training %d steps" % args.steps)
+        got_train = workload.train_trace(be, steps=args.steps, dim=args.dim,
+                                         layers=args.layers)
+        rl, gl = ref_payload["train"]["losses"], got_train["losses"]
+        n = min(len(rl), len(gl))
+        train_cmp = {
+            "steps": n,
+            "ref_final": rl[n - 1],
+            "got_final": gl[n - 1],
+            "loss_gap": abs(rl[n - 1] - gl[n - 1]),
+            "first_step_gap": abs(rl[0] - gl[0]) if n else None,
+            "ref_losses": rl[:n],
+            "got_losses": gl[:n],
+            "checkpoints": compare.compare_checkpoints(
+                ref_payload["train"], got_train, args.tol),
+        }
+
+    grade = compare.grade(probe_results, internal, layer_rows, train_cmp)
+    fd = compare.first_divergence(layer_rows) if layer_rows else None
+
+    result = {
+        "version": __version__,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "reference": obl.describe(ref),
+        "target": "%s on %s (%s, torch %s)" % (
+            info.get("name"), info.get("host"), info.get("backend"), info.get("torch")),
+        "reference_device": ref.get("device"),
+        "target_device": info,
+        "probes": probe_results,
+        "internal": internal,
+        "layers": layer_rows,
+        "first_divergence": fd,
+        "attribution": attribution,
+        "training": train_cmp,
+        "grade": grade,
+    }
+
+    _p("")
+    _p(report.text(result))
+
+    if args.out:
+        report.save_json(result, args.out)
+        _p("")
+        _p("  result written to %s" % args.out)
+    if args.html:
+        with open(args.html, "w") as fh:
+            fh.write(report.html_report(result))
+        _p("  report written to %s" % args.html)
+    return 0
+
+
+# ------------------------------------------------------------------ report
+
+def cmd_report(args):
+    from . import report
+    with open(args.result) as fh:
+        result = json.load(fh)
+    if args.html:
+        with open(args.html, "w") as fh:
+            fh.write(report.html_report(result))
+        _p("report written to %s" % args.html)
+    else:
+        _p(report.text(result))
+    return 0
+
+
+# ------------------------------------------------------------------ probes
+
+def cmd_probes(args):
+    from . import probes
+    _p("")
+    _p("  %d probes" % len(probes.REGISTRY))
+    _p("")
+    layer = None
+    for entry in sorted(probes.REGISTRY, key=lambda e: (e["layer"], e["id"])):
+        if entry["layer"] != layer:
+            layer = entry["layer"]
+            _p("  %s" % layer.upper())
+        _p("    %-26s %-34s %s" % (entry["id"], entry["title"], entry["severity"]))
+    _p("")
+    return 0
+
+
+# ------------------------------------------------------------------ sample
+
+def cmd_sample(args):
+    """The smallest possible demonstration: identical code, identical seed."""
+    import torch
+    from . import backend as B
+
+    be = B.pick(args.backend)
+    dev = be.device
+    info = be.info()
+    _p("")
+    _p("  device   %s" % info.get("name"))
+    _p("  backend  %s" % info.get("backend"))
+    _p("  torch    %s" % info.get("torch"))
+    _p("")
+
+    def show(label, values):
+        _p("  %-22s %s" % (label, "  ".join("%+.8f" % v for v in values)))
+
+    torch.manual_seed(args.seed)
+    show("rand (uniform)", [float(v) for v in torch.rand(4, device=dev)])
+    torch.manual_seed(args.seed)
+    show("randn (normal)", [float(v) for v in torch.randn(4, device=dev)])
+    torch.manual_seed(args.seed)
+    layer = torch.nn.Linear(8, 4).to(dev)
+    show("Linear init weights", [float(v) for v in layer.weight[0][:4]])
+
+    x = torch.arange(1, 5, dtype=torch.float32, device=dev)
+    for name in ("log1p", "erf", "expm1", "digamma", "i0"):
+        fn = getattr(torch, name, None)
+        if fn is None:
+            continue
+        try:
+            show(name, [float(v) for v in fn(x)])
+        except Exception as exc:
+            _p("  %-22s %s" % (name, ("%s: %s" % (type(exc).__name__,
+               str(exc).split(chr(10))[0]))[:52]))
+    _p("")
+    _p("  Run this on two machines and read the two outputs side by side.")
+    _p("")
+    return 0
+
+
+# ------------------------------------------------------------------ main
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="obe",
+        description="Verify that code runs correctly on a different accelerator, "
+                    "not just that it runs.")
+    ap.add_argument("--version", action="version", version="obelisk %s" % __version__)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("devices", help="list the accelerators visible here")
+    p.set_defaults(fn=cmd_devices)
+
+    p = sub.add_parser("probes", help="list the assumptions Obelisk knows how to test")
+    p.set_defaults(fn=cmd_probes)
+
+    p = sub.add_parser("inspect", help="read a repository and predict its risk")
+    p.add_argument("path")
+    p.add_argument("--out", help="write the findings as JSON")
+    p.add_argument("--full", action="store_true", help="keep every finding, not the first 200")
+    p.set_defaults(fn=cmd_inspect)
+
+    p = sub.add_parser("migrate", help="rewrite a repository for another backend")
+    p.add_argument("path")
+    p.add_argument("--target", default="musa", choices=["musa", "cuda"])
+    p.add_argument("--apply", action="store_true", help="write the changes to disk")
+    p.add_argument("--patch", help="write the unified diff here")
+    p.set_defaults(fn=cmd_migrate)
+
+    common = dict(dim=256, layers=4)
+    p = sub.add_parser("record", help="measure this device and write a reference blueprint")
+    p.add_argument("--backend", default="auto")
+    p.add_argument("--out", default="reference.obl")
+    p.add_argument("--only", nargs="*", help="only these probe ids or prefixes")
+    p.add_argument("--steps", type=int, default=50, help="training steps to record (0 to skip)")
+    p.add_argument("--no-trace", action="store_true")
+    p.add_argument("--dim", type=int, default=common["dim"])
+    p.add_argument("--layers", type=int, default=common["layers"])
+    p.set_defaults(fn=cmd_record)
+
+    p = sub.add_parser("verify", help="compare this device against a reference blueprint")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--backend", default="auto")
+    p.add_argument("--only", nargs="*")
+    p.add_argument("--tol", type=float, default=None, help="override the dtype tolerance")
+    p.add_argument("--steps", type=int, default=50)
+    p.add_argument("--no-trace", action="store_true")
+    p.add_argument("--dim", type=int, default=common["dim"])
+    p.add_argument("--layers", type=int, default=common["layers"])
+    p.add_argument("--out", help="write the full result as JSON")
+    p.add_argument("--html", help="write the report as a web page")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("sample", help="print a few numbers; run it on two machines")
+    p.add_argument("--backend", default="auto")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(fn=cmd_sample)
+
+    p = sub.add_parser("report", help="render a saved result")
+    p.add_argument("result")
+    p.add_argument("--html")
+    p.set_defaults(fn=cmd_report)
+
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 0
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        _p("")
+        _p("  %s: %s" % (type(exc).__name__, exc))
+        if os.environ.get("OBE_TRACEBACK"):
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

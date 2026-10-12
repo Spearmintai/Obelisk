@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obelisk-ai"
+version = "0.1.0"
+description = "Verify that your code runs correctly on a different accelerator, not just that it runs."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch"]
+
+[project.scripts]
+obe = "obelisk.cli:main"
+
+[tool.setuptools]
+packages = ["obelisk"]
