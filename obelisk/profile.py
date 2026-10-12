@@ -8,6 +8,7 @@ once per device, and every pairing after that is free.
 """
 
 from .compare import compare_probes, check_internal, grade
+from .coverage import is_stochastic
 from .fingerprint import compare_fingerprints
 
 
@@ -45,6 +46,8 @@ def diff_coverage(ref_cov, got_cov):
     for op, r in sorted(ref_ops.items()):
         g = got_ops.get(op)
         if g is None:
+            continue
+        if is_stochastic(op):
             continue
         rs, gs = r.get("status"), g.get("status")
         if rs == gs and rs in ("EXACT", "CLOSE"):

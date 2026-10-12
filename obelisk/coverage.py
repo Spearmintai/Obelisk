@@ -15,6 +15,31 @@ list of the author's mistakes.
 import math
 import re
 
+# Operators that draw on randomness every time they are called.  Two runs of one
+# of these disagree on one device as readily as on two, so comparing them across
+# devices measures nothing.  They are recorded and set aside.
+STOCHASTIC = {
+    "dropout", "dropout1d", "dropout2d", "dropout3d", "alpha_dropout",
+    "feature_alpha_dropout", "rrelu", "bernoulli", "multinomial", "poisson",
+    "normal", "binomial", "randperm", "randint_like", "rand_like", "randn_like",
+}
+
+
+# Operators that hand back whatever was in memory.  Their contents are not a
+# result, so two devices disagreeing about them is not a finding.
+UNINITIALIZED = {
+    "empty", "empty_like", "empty_strided", "empty_permuted", "new_empty",
+    "new_empty_strided",
+}
+
+
+def is_stochastic(op):
+    """True when an operator's output is not a function of its input alone."""
+    _, _, name = op.partition(".")
+    name = name.rstrip("_")
+    return name in STOCHASTIC or name in UNINITIALIZED
+
+
 MISSING_PATTERNS = re.compile(
     r"not implemented|could not run|no kernel|unsupported|not supported|"
     r"doesn't exist for this backend|NotImplementedError", re.I)
@@ -196,6 +221,15 @@ def sweep(backend, dtypes=("float32",), limit=None, verbose=False, progress=None
             results.append(record)
             if verbose:
                 print("    %-40s %s" % (name, record["status"]))
+            continue
+
+        if is_stochastic(name):
+            record["status"] = "STOCHASTIC"
+            record["detail"] = ("output is not a function of the input alone; "
+                                "not comparable across devices")
+            counts.setdefault("stochastic", 0)
+            counts["stochastic"] += 1
+            results.append(record)
             continue
 
         kind, worst = _agreement(ref_out, got_tensors, torch)

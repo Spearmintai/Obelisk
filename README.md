@@ -121,6 +121,81 @@ measurements it came from and a withdrawn measurement can be named exactly.
 Profiles accumulate. Ten cards is ten hardware sessions and forty-five pairings,
 and every pairing after the first is a file read.
 
+## Making it run, and saying what that cost
+
+A missing operator is rarely a missing capability. log1p is log(1+x), asinh is a
+logarithm and a square root, a standard deviation is the square root of a
+variance. The hardware can nearly always do the work; what it lacks is someone to
+write the arrangement down.
+
+```
+obe run train.py
+```
+
+patches what the device cannot do and runs the program. Three kinds of
+substitution, and every one of them recorded:
+
+| | |
+|---|---|
+| rewrite | expressed in operators the device does have, still on the device |
+| fallback | computed on the CPU, which is correct and slow, and the ledger says how slow |
+| correct | the device has the operator, and the operator is wrong |
+
+On the MTT S4000 an ordinary piece of scientific PyTorch dies at line 11 with
+`aten::std.correction`. Under `obe run` it completes, having stood in for 66
+operators, and finishes with this:
+
+```
+  LEDGER: what did not happen the way you wrote it
+
+   operator                 how            calls    seconds
+   selu                     correct            2      0.000
+   slogdet                  fallback           1      0.001
+   std                      rewrite            1      0.000
+   median                   rewrite            1      0.054
+   ...
+   10 call(s) through 9 substituted operator(s), 0.056 s total
+   0.001 s of that was spent moving data to the CPU and back
+   selu was called 2 time(s); the device kernel is wrong, so the result you
+   got is not the result the device would have given
+```
+
+The point is not that the program stopped crashing. Anything can stop a program
+crashing. The point is the last line, which a silent compatibility layer would
+never tell you.
+
+## When the card and the code are in different places
+
+They almost always are. The code is on a laptop or a build server; the card is in
+a machine room with no route out, and nobody has put the code on it yet. That is
+exactly why nobody checks.
+
+```
+obe dump --out s4000.obl              # on the card, with none of your code present
+scp s4000.obl laptop:                 # one file, under a megabyte
+obe check ./repo --card s4000.obl     # on a box with no accelerator and no torch
+```
+
+```
+  CODE AGAINST CARD                                               GRADE  C
+
+  code   ./normalizing-flows  (71 python files)
+  card   MTT S4000  (musa)
+
+  7 operations this code calls would fail here, and all of them can be substituted.
+
+  WILL NOT RUN
+   x  torch.slogdet         MISSING   obe can run it on the CPU   4 call sites
+        normflows/flows/mixing.py:117
+   x  torch.std             MISSING   obe can rewrite it          3 call sites
+        normflows/flows/normalization.py:23
+   x  F.logsigmoid          MISSING   obe can rewrite it          2 call sites
+   x  torch.qr              MISSING   obe can run it on the CPU   2 call sites
+```
+
+Nobody bought anything, nobody shipped code into a machine room, and nobody
+waited for a slot on a card.
+
 ## What it checks
 
 Fifteen probes, each isolating one assumption that programs make about their
@@ -163,6 +238,8 @@ diverging* rather than a wall of numbers.
 | | |
 |---|---|
 | `obe sample` | print a few numbers; run it on two machines and read them side by side |
+| `obe run` | run a program with the gaps filled in, and report every substitution |
+| `obe check` | judge a repository against a card profiled somewhere else |
 | `obe dump` | profile this device completely: operators, dtypes, probes |
 | `obe diff a.obl b.obl` | compare two profiles with no hardware present |
 | `obe record` | measure the reference for one workload |

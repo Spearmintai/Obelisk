@@ -258,6 +258,159 @@ def cmd_probes(args):
     return 0
 
 
+# ------------------------------------------------------------------ check
+
+def cmd_check(args):
+    """Judge a repository against a card that is not here."""
+    from . import check as C, obl, shim
+
+    profile = obl.load(args.card)
+    ok = obl.verify_digest(profile)
+    if ok is False:
+        _p("  this profile does not match its own digest; it has been altered "
+           "since it was written")
+        return 2
+
+    result = C.check(args.path, profile, shim.handled())
+    grade, why = C.verdict(result)
+
+    _p("")
+    _p("=" * 78)
+    _p(("  CODE AGAINST CARD").ljust(68) + ("GRADE  %s" % grade))
+    _p("=" * 78)
+    _p("  code   %s  (%d python files)" % (result["repo"], result["files"]))
+    _p("  card   %s  (%s)" % (result["card"], result["card_backend"]))
+    _p("  taken  %s" % (profile.get("created") or "?"))
+    _p("")
+    _p("  %s." % (why[0].upper() + why[1:]))
+    _p("")
+    _p("  Neither the card nor this code has met the other. The card was")
+    _p("  measured on its own, with none of this code present.")
+    _p("")
+
+    def show(title, rows, mark):
+        if not rows:
+            return
+        _p("-" * 78)
+        _p("  %s" % title)
+        for r in rows[:16]:
+            tag = "" if not r["weak"] else "  (name match only)"
+            fix = {"rewrite": "obe can rewrite it",
+                   "fallback": "obe can run it on the CPU",
+                   "correct": "obe can replace it"}.get(r["shim"], "no substitute")
+            _p("   %s  %-26s %-9s %-24s %d call site%s%s"
+               % (mark, r["op"], r["status"], fix, r["count"],
+                  "" if r["count"] == 1 else "s", tag))
+            for f, line in r["sites"][:3]:
+                _p("        %s:%d" % (f, line))
+        if len(rows) > 16:
+            _p("      and %d more" % (len(rows) - 16))
+        _p("")
+
+    show("WILL NOT RUN", result["blocking"], "x")
+    show("RUNS AND RETURNS THE WRONG ANSWER", result["wrong"], "!")
+    show("RUNS, WITH A DIFFERENT RESULT", result["risky"], "~")
+
+    if result["dtypes"]:
+        _p("-" * 78)
+        _p("  DATA TYPES THIS CARD CANNOT COMPUTE WITH")
+        for row in result["dtypes"]:
+            _p("   %-12s %s" % (row["dtype"], ", ".join(row["unsupported"])))
+        _p("")
+
+    shimmable = len([r for r in result["blocking"] if r["shim"]])
+    _p("-" * 78)
+    _p("  %d operation(s) verified to behave the same" % result["confirmed_ok"])
+    if result["blocking"]:
+        _p("  %d of %d blocking operations can be substituted by obe run"
+           % (shimmable, len(result["blocking"])))
+    _p("  card profile digest %s" % (result["card_digest"] or "?"))
+    _p("=" * 78)
+
+    if args.out:
+        result["grade"] = {"grade": grade, "why": why}
+        with open(args.out, "w") as fh:
+            json.dump(result, fh, indent=1)
+        _p("")
+        _p("  written to %s" % args.out)
+    return 0
+
+
+# ------------------------------------------------------------------ run
+
+def cmd_run(args):
+    """Run a program with the gaps filled in, and report what was filled."""
+    import runpy
+    import sys as _sys
+    from . import backend as B, shim
+
+    be = B.pick(args.backend)
+    _p("")
+    _p("  OBELISK RUN  on %s" % be.info().get("name"))
+    _p("")
+    _p("  checking which operators need standing in for")
+    ledger = shim.activate(be, verbose=True)
+    rows = ledger.rows()
+    _p("")
+    _p("  %d operator(s) patched: %d rewritten, %d corrected, %d sent to the CPU"
+       % (len(rows),
+          len([r for r in rows if r["strategy"] == "rewrite"]),
+          len([r for r in rows if r["strategy"] == "correct"]),
+          len([r for r in rows if r["strategy"] == "fallback"])))
+    _p("")
+    _p("-" * 78)
+
+    argv = [args.script] + list(args.args or [])
+    old_argv = _sys.argv
+    _sys.argv = argv
+    status = 0
+    try:
+        runpy.run_path(args.script, run_name="__main__")
+    except SystemExit as exc:
+        status = exc.code if isinstance(exc.code, int) else 0
+    except Exception as exc:
+        _p("")
+        _p("  the program raised: %s: %s" % (type(exc).__name__, exc))
+        status = 1
+        if os.environ.get("OBE_TRACEBACK"):
+            raise
+    finally:
+        _sys.argv = old_argv
+
+    _p("-" * 78)
+    _p("")
+    _p("  LEDGER: what did not happen the way you wrote it")
+    _p("")
+    used = [r for r in ledger.rows() if r["calls"]]
+    if not used:
+        _p("   Nothing. Every operator this program called was the device's own.")
+    else:
+        _p("   %-24s %-9s %10s %10s" % ("operator", "how", "calls", "seconds"))
+        for r in sorted(used, key=lambda r: -r["calls"]):
+            _p("   %-24s %-9s %10d %10.3f"
+               % (r["op"], r["strategy"], r["calls"], r["seconds"]))
+        s = ledger.summary()
+        _p("")
+        _p("   %d call(s) through %d substituted operator(s), %.3f s total"
+           % (s["calls"], s["exercised"], s["seconds"]))
+        if s["fallback_seconds"] > 0:
+            _p("   %.3f s of that was spent moving data to the CPU and back"
+               % s["fallback_seconds"])
+        corrected = [r for r in used if r["strategy"] == "correct"]
+        for r in corrected:
+            _p("   %s was called %d time(s); the device kernel is wrong, so the "
+               "result you got is not the result the device would have given"
+               % (r["op"], r["calls"]))
+    _p("")
+
+    if args.ledger:
+        with open(args.ledger, "w") as fh:
+            json.dump({"device": be.info(), "summary": ledger.summary(),
+                       "operators": ledger.rows()}, fh, indent=1)
+        _p("  ledger written to %s" % args.ledger)
+    return status
+
+
 # ------------------------------------------------------------------ dump
 
 def cmd_dump(args):
@@ -434,6 +587,19 @@ def build_parser():
     p.add_argument("--out", help="write the full result as JSON")
     p.add_argument("--html", help="write the report as a web page")
     p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("check", help="judge a repository against a card profiled elsewhere")
+    p.add_argument("path")
+    p.add_argument("--card", required=True, help="a profile written by obe dump")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("run", help="run a program with missing operators filled in")
+    p.add_argument("script")
+    p.add_argument("args", nargs="*")
+    p.add_argument("--backend", default="auto")
+    p.add_argument("--ledger", help="write the ledger as JSON")
+    p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("dump", help="record everything measurable about this device")
     p.add_argument("--backend", default="auto")
