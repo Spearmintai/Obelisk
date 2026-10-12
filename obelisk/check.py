@@ -22,12 +22,25 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "build",
 TORCH_ALIASES = {"torch", "th"}
 FUNCTIONAL_ALIASES = {"F", "functional"}
 
+# Modules that share names with torch operators and have nothing to do with it.
+# tl is Triton's language namespace, whose exp2 runs on the GPU but is compiled
+# by Triton rather than dispatched by PyTorch.
+NOT_TORCH = {
+    "np", "numpy", "math", "cmath", "scipy", "sp", "pd", "pandas", "random",
+    "os", "sys", "re", "json", "time", "datetime", "itertools", "statistics",
+    "tl", "triton", "tlx", "cp", "cupy", "jnp", "jax", "tf", "plt", "nn",
+    "self", "cls", "args", "config", "cfg", "parser", "logger", "logging",
+}
+
 
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, path):
+    def __init__(self, path, imports_torch=True):
         self.path = path
         self.calls = []
         self.aliases = dict()
+        # A bare method call such as x.std() is only evidence of a torch call if
+        # this file has any torch in it at all.
+        self.imports_torch = imports_torch
 
     def visit_Import(self, node):
         for a in node.names:
@@ -65,7 +78,6 @@ class _Visitor(ast.NodeVisitor):
     def _record(self, parts, lineno):
         name = parts[-1]
         root = parts[0]
-        joined = ".".join(parts)
         if root in TORCH_ALIASES or self.aliases.get(root) == "torch":
             if "functional" in parts:
                 self.calls.append(("F", name, lineno))
@@ -73,10 +85,12 @@ class _Visitor(ast.NodeVisitor):
                 self.calls.append(("torch", name, lineno))
         elif root in FUNCTIONAL_ALIASES or self.aliases.get(root) == "F":
             self.calls.append(("F", name, lineno))
-        elif joined.startswith("np.") or joined.startswith("numpy."):
+        elif root in NOT_TORCH or len(parts) > 2:
+            # Another library's namespace, or a path too deep to be a tensor
+            # method; neither is evidence about this device.
             return
-        else:
-            # Could be a tensor method; recorded as a weaker signal.
+        elif self.imports_torch:
+            # Possibly a tensor method.  Recorded, but marked as weaker.
             self.calls.append(("method", name, lineno))
 
 
@@ -94,12 +108,13 @@ def scan_calls(root):
             path = os.path.join(dirpath, fn)
             try:
                 with open(path, errors="ignore") as fh:
-                    tree = ast.parse(fh.read(), path)
+                    source = fh.read()
+                tree = ast.parse(source, path)
             except Exception:
                 continue
             files += 1
             rel = os.path.relpath(path, root)
-            v = _Visitor(rel)
+            v = _Visitor(rel, imports_torch=("import torch" in source))
             v.visit(tree)
             for kind, name, lineno in v.calls:
                 uses.setdefault((kind, name), []).append((rel, lineno))
@@ -191,23 +206,38 @@ def check(repo, profile, shim_table=None):
 
 
 def verdict(result):
-    """A grade, and the sentence that justifies it."""
-    blocking = [r for r in result["blocking"] if not r["weak"]]
-    wrong = [r for r in result["wrong"] if not r["weak"]]
-    unshimmable = [r for r in blocking if not r["shim"]]
+    """A grade, and the sentence that justifies it.
 
-    if wrong:
-        return "D", ("%d operation%s this code calls returns a wrong answer on "
-                     "this card, without raising" %
-                     (len(wrong), "" if len(wrong) == 1 else "s"))
+    A call written as torch.std is certain.  One written as x.std() is probable,
+    because x might not be a tensor.  Both count; the wording says which is
+    which, and the grade never claims more than the findings below it.
+    """
+    blocking, wrong = result["blocking"], result["wrong"]
+    hard = [r for r in blocking if not r["weak"]]
+    soft = [r for r in blocking if r["weak"]]
+    wrong_hard = [r for r in wrong if not r["weak"]]
+    wrong_soft = [r for r in wrong if r["weak"]]
+    unshimmable = [r for r in hard if not r["shim"]]
+
+    def count(n, noun="operation"):
+        return "%d %s%s" % (n, noun, "" if n == 1 else "s")
+
+    if wrong_hard:
+        return "D", ("%s this code calls returns a wrong answer on this card, "
+                     "without raising" % count(len(wrong_hard)))
     if unshimmable:
-        return "D", ("%d operation%s this code calls cannot run on this card and "
-                     "cannot be substituted" %
-                     (len(unshimmable), "" if len(unshimmable) == 1 else "s"))
-    if blocking:
-        return "C", ("%d operation%s this code calls would fail here, and all of "
-                     "them can be substituted" %
-                     (len(blocking), "" if len(blocking) == 1 else "s"))
+        return "D", ("%s this code calls cannot run on this card and cannot be "
+                     "substituted" % count(len(unshimmable)))
+    if hard or soft or wrong_soft:
+        parts = []
+        if hard:
+            parts.append("%s certainly" % count(len(hard)))
+        if soft:
+            parts.append("%s probably" % count(len(soft)))
+        if wrong_soft:
+            parts.append("%s possibly returning a wrong answer" % count(len(wrong_soft)))
+        return "C", (" and ".join(parts) +
+                     " would fail here, and every one can be substituted")
     if result["risky"]:
         return "B", "every operation runs; some return slightly different numbers"
     return "A", "every operation this code calls behaves the same on this card"

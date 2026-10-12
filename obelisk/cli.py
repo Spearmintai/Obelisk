@@ -20,8 +20,15 @@ def cmd_devices(args):
     from . import backend as B
     found = B.available()
     if not found:
-        _p("torch is not installed in this interpreter")
-        return 1
+        _p("")
+        _p("  No accelerator is visible from this interpreter, because PyTorch")
+        _p("  is not installed here.")
+        _p("")
+        _p("  That is fine for most of what obe does. inspect, check, diff and")
+        _p("  report all read files and need no hardware. Only record, verify,")
+        _p("  dump, run and sample have to be on the machine with the card.")
+        _p("")
+        return 0
     _p("%d backend(s) available here" % len(found))
     for b in found:
         info = b.info()
@@ -271,7 +278,15 @@ def cmd_check(args):
            "since it was written")
         return 2
 
+    if not os.path.isdir(os.path.expanduser(args.path)):
+        _p("  %s is not a directory" % args.path)
+        return 2
+
     result = C.check(args.path, profile, shim.handled())
+    if not result["files"]:
+        _p("  no Python files found under %s, so there is nothing to check"
+           % result["repo"])
+        return 2
     grade, why = C.verdict(result)
 
     _p("")

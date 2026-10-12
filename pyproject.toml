@@ -3,12 +3,28 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "obelisk-ai"
+name = "obelisk-env"
 version = "0.1.0"
 description = "Verify that your code runs correctly on a different accelerator, not just that it runs."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
+authors = [{name = "Beijing Huahuo Zhichuang Technology Co., Ltd."}]
+keywords = [
+    "accelerator", "gpu", "npu", "cuda", "musa", "ascend", "pytorch",
+    "porting", "migration", "numerical", "verification", "conformance",
+    "reproducibility", "hardware", "domestic-ai-chips",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Hardware",
+]
 dependencies = []
 
 [project.optional-dependencies]

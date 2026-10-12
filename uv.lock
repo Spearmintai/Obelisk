@@ -938,7 +938,7 @@ wheels = [
 ]
 
 [[package]]
-name = "obelisk-ai"
+name = "obelisk-env"
 version = "0.1.0"
 source = { editable = "." }
 
