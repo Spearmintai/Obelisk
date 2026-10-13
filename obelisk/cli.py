@@ -265,18 +265,81 @@ def cmd_probes(args):
     return 0
 
 
+# ------------------------------------------------------------------ cards
+
+def cmd_cards(args):
+    """List the devices this copy of Obelisk already knows about."""
+    from . import library
+
+    if args.profile:
+        from . import obl
+        profile = obl.load(args.profile)
+        card = library.from_profile(profile)
+        out = args.out or (library.slug(card["device"]) + ".json")
+        library.save(card, out)
+        size = os.path.getsize(out) / 1024.0
+        _p("")
+        _p("  card written to %s  (%.1f KB)" % (out, size))
+        _p("  %d operators unavailable, %d returning a different answer"
+           % (len(card["missing"]), len(card["wrong"])))
+        _p("")
+        _p("  This is the publishable tier. It says what works and what does")
+        _p("  not, and carries no measured values of any kind.")
+        _p("")
+        return 0
+
+    entries = library.bundled()
+    _p("")
+    if not entries:
+        _p("  No cards are bundled with this copy.")
+        _p("  Make one from a profile:  obe cards --profile device.obl")
+        _p("")
+        return 0
+    _p("  %d device(s) measured and shipped with this copy of Obelisk" % len(entries))
+    _p("")
+    _p("  %-34s %-9s %8s %7s %7s" % ("card", "backend", "missing", "wrong", "ok"))
+    _p("  " + "-" * 70)
+    for e in entries:
+        c = e["card"]
+        _p("  %-34s %-9s %8d %7d %7d"
+           % (e["name"][:34], (c.get("device") or {}).get("backend", "?"),
+              len(c.get("missing", [])), len(c.get("wrong", [])),
+              c.get("exact", 0) + c.get("close", 0)))
+    _p("")
+    _p("  Use one by name:   obe check ./repo --card %s" % entries[0]["name"])
+    _p("")
+    _p("  Every card records the framework and driver it was measured under.")
+    _p("  A card is only true of that configuration.")
+    _p("")
+    return 0
+
+
 # ------------------------------------------------------------------ check
 
 def cmd_check(args):
     """Judge a repository against a card that is not here."""
     from . import check as C, obl, shim
 
-    profile = obl.load(args.card)
-    ok = obl.verify_digest(profile)
-    if ok is False:
-        _p("  this profile does not match its own digest; it has been altered "
-           "since it was written")
+    from . import library
+    try:
+        path, bundled_name = library.resolve(args.card)
+    except FileNotFoundError as exc:
+        _p("  %s" % exc)
         return 2
+
+    raw = json.load(open(path))
+    if raw.get("format") == library.CARD_FORMAT:
+        card = raw
+        profile = library.as_profile(card)
+        notes = library.staleness(card)
+    else:
+        profile = obl.load(path)
+        card = None
+        notes = []
+        if obl.verify_digest(profile) is False:
+            _p("  this profile does not match its own digest; it has been "
+               "altered since it was written")
+            return 2
 
     if not os.path.isdir(os.path.expanduser(args.path)):
         _p("  %s is not a directory" % args.path)
@@ -294,8 +357,11 @@ def cmd_check(args):
     _p(("  CODE AGAINST CARD").ljust(68) + ("GRADE  %s" % grade))
     _p("=" * 78)
     _p("  code   %s  (%d python files)" % (result["repo"], result["files"]))
-    _p("  card   %s  (%s)" % (result["card"], result["card_backend"]))
+    _p("  card   %s  (%s)%s" % (result["card"], result["card_backend"],
+                                 "  [bundled]" if bundled_name else ""))
     _p("  taken  %s" % (profile.get("created") or "?"))
+    for note in notes:
+        _p("  note   %s" % note)
     _p("")
     _p("  %s." % (why[0].upper() + why[1:]))
     _p("")
@@ -615,9 +681,15 @@ def build_parser():
     p.add_argument("--html", help="write the report as a web page")
     p.set_defaults(fn=cmd_verify)
 
+    p = sub.add_parser("cards", help="list the devices Obelisk already knows about")
+    p.add_argument("--profile", help="reduce this profile to a publishable card")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_cards)
+
     p = sub.add_parser("check", help="judge a repository against a card profiled elsewhere")
     p.add_argument("path")
-    p.add_argument("--card", required=True, help="a profile written by obe dump")
+    p.add_argument("--card", required=True,
+                   help="a profile from obe dump, or the name of a bundled card")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_check)
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "obelisk-env"
-version = "0.1.0"
+version = "0.1.1"
 description = "Verify that your code runs correctly on a different accelerator, not just that it runs."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -35,3 +35,6 @@ obe = "obelisk.cli:main"
 
 [tool.setuptools]
 packages = ["obelisk"]
+
+[tool.setuptools.package-data]
+obelisk = ["cards/*.json"]

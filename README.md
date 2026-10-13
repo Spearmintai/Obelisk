@@ -164,6 +164,41 @@ The point is not that the program stopped crashing. Anything can stop a program
 crashing. The point is the last line, which a silent compatibility layer would
 never tell you.
 
+## The card library
+
+Obelisk ships with a capability card for every device that has been measured, so
+you can check your code against hardware you do not own.
+
+```
+$ obe cards
+
+  2 device(s) measured and shipped with this copy of Obelisk
+
+  card                     backend    missing   wrong      ok
+  mtt-s4000-musa           musa           108      13     278
+  rtx-4090-cuda            cuda             3      10     386
+
+$ obe check ./my-repo --card mtt-s4000-musa
+```
+
+A full profile is most of a megabyte, because it carries the numerical
+fingerprints needed to answer whether your code runs *correctly*. The question
+of whether it runs at all needs far less: which operators work, which do not,
+and which data types can compute. That reduces to about three kilobytes, which
+is small enough to ship.
+
+A card is only true of the configuration it was measured on. A driver update or
+a framework upgrade can add or remove kernels, so every card records the
+versions it was taken under and `obe check` prints them. A stale card is worse
+than no card, because it is believed.
+
+To add your own hardware, measure it once and reduce it:
+
+```
+obe dump --out card.obl
+obe cards --profile card.obl
+```
+
 ## When the card and the code are in different places
 
 They almost always are. The code is on a laptop or a build server; the card is in
