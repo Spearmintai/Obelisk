@@ -400,10 +400,22 @@ def cmd_run(args):
     if not used:
         _p("   Nothing. Every operator this program called was the device's own.")
     else:
-        _p("   %-24s %-9s %10s %10s" % ("operator", "how", "calls", "seconds"))
+        _p("   %-22s %-9s %8s %9s %13s"
+           % ("operator", "how", "calls", "seconds", "accuracy"))
         for r in sorted(used, key=lambda r: -r["calls"]):
-            _p("   %-24s %-9s %10d %10.3f"
-               % (r["op"], r["strategy"], r["calls"], r["seconds"]))
+            acc = r.get("accuracy")
+            shown = ("%.1e" % acc["error"]) if acc else "exact"
+            _p("   %-22s %-9s %8d %9.3f %13s"
+               % (r["op"], r["strategy"], r["calls"], r["seconds"], shown))
+        degraded = [r for r in used if r.get("accuracy")
+                    and r["accuracy"]["baseline"] > 0
+                    and r["accuracy"]["error"] > 20 * r["accuracy"]["baseline"]]
+        for r in degraded:
+            a = r["accuracy"]
+            _p("")
+            _p("   %s is accurate to %.1e here, where a proper kernel reaches "
+               "%.1e. The gap is widest %s."
+               % (r["op"], a["error"], a["baseline"], a["regime"]))
         s = ledger.summary()
         _p("")
         _p("   %d call(s) through %d substituted operator(s), %.3f s total"

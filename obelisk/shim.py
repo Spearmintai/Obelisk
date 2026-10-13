@@ -28,7 +28,7 @@ LN2 = 0.6931471805599453
 # still say what the shim would be able to do.
 REWRITE_NAMES = (
     "log1p expm1 exp2 sinh cosh asin arcsin asinh arcsinh acosh arccosh atanh "
-    "arctanh erfc logit sinc hypot copysign signbit trunc fix logaddexp "
+    "arctanh logit sinc hypot copysign signbit trunc fix logaddexp "
     "logaddexp2 logical_xor isposinf isneginf heaviside clamp_min clamp_max "
     "float_power rsub nansum nanmean std std_mean median kthvalue "
     "F.logsigmoid F.mish F.softshrink F.hardshrink").split()
@@ -36,7 +36,7 @@ REWRITE_NAMES = (
 CORRECTION_NAMES = ("selu", "F.selu")
 
 FALLBACK_NAMES = (
-    "lgamma digamma mvlgamma i0 erfinv polygamma det logdet slogdet svd qr "
+    "erfc lgamma digamma mvlgamma i0 erfinv polygamma det logdet slogdet svd qr "
     "cholesky matrix_exp triangular_solve cholesky_solve lu cdist pdist "
     "nanmedian cummax cummin aminmax angle frexp gcd lcm nextafter "
     "logcumsumexp").split()
@@ -61,8 +61,9 @@ class Ledger:
         self.entries = {}
         self.decisions = {}
 
-    def decide(self, name, strategy, reason):
-        self.decisions[name] = {"strategy": strategy, "reason": reason}
+    def decide(self, name, strategy, reason, accuracy=None):
+        self.decisions[name] = {"strategy": strategy, "reason": reason,
+                                "accuracy": accuracy}
 
     def record(self, name, seconds):
         e = self.entries.setdefault(name, {"calls": 0, "seconds": 0.0})
@@ -77,6 +78,7 @@ class Ledger:
                 "op": name,
                 "strategy": d["strategy"],
                 "reason": d["reason"],
+                "accuracy": d.get("accuracy"),
                 "calls": used["calls"],
                 "seconds": used["seconds"],
             })
@@ -102,8 +104,98 @@ class Ledger:
 # --------------------------------------------------------------- rewrites
 # Each one is the operator written out in terms of operators that exist.
 
+def _stable(torch):
+    """Numerically careful substitutes.
+
+    log1p exists because log(1+x) is wrong for small x: 1+x rounds to 1 and the
+    answer collapses to zero.  A substitute that ignores this runs, returns a
+    wrong number and says nothing, which is the exact fault this tool was built
+    to catch.  So each substitute below is written the way a library would write
+    it, and measured against a proper kernel at startup.
+    """
+
+    def log1p(x):
+        u = 1.0 + x
+        d = torch.where(u == 1.0, torch.ones_like(u), u - 1.0)
+        return torch.where(u == 1.0, x, torch.log(u) * x / d)
+
+    def expm1(x):
+        u = torch.exp(x)
+        lu = torch.log(u)
+        d = torch.where((u == 1.0) | (lu == 0.0), torch.ones_like(u), lu)
+        naive = (u - 1.0) * x / d
+        return torch.where(u == 1.0, x, torch.where(u - 1.0 == -1.0,
+                                                    -torch.ones_like(x), naive))
+
+    def asinh(x):
+        a = x.abs()
+        inner = a + a * a / (1.0 + torch.sqrt(1.0 + a * a))
+        return torch.sign(x) * log1p(inner)
+
+    def atanh(x):
+        return 0.5 * log1p(2.0 * x / (1.0 - x))
+
+    def sinh(x):
+        return 0.5 * (expm1(x) - expm1(-x))
+
+    def cosh(x):
+        return 0.5 * (torch.exp(x) + torch.exp(-x))
+
+    return {"log1p": log1p, "expm1": expm1, "asinh": asinh, "atanh": atanh,
+            "sinh": sinh, "cosh": cosh}
+
+
+# The ranges where each substitute has to be checked.  The second entry of each
+# pair is the regime the operator exists for, and the one a naive rewrite fails.
+REGIMES = {
+    "log1p": [("ordinary", -0.9, 3.0, False), ("near zero", -8, -3, True)],
+    "expm1": [("ordinary", -3.0, 3.0, False), ("near zero", -8, -3, True)],
+    "atanh": [("ordinary", 0.1, 0.8, False), ("near zero", -8, -3, True)],
+    "asinh": [("ordinary", -3.0, 3.0, False), ("large", 3, 7, True)],
+    "sinh": [("ordinary", -3.0, 3.0, False), ("near zero", -7, -3, True)],
+    "cosh": [("ordinary", -3.0, 3.0, False)],
+    "exp2": [("ordinary", -5.0, 5.0, False)],
+    "erfc": [("ordinary", 0.1, 1.0, False)],
+    "logit": [("ordinary", 0.05, 0.95, False)],
+    "hypot": [("ordinary", -3.0, 3.0, False)],
+}
+
+
+def measure(name, impl, torch, dev):
+    """How close is this substitute to what a proper kernel would return.
+
+    The reference is the operator evaluated in float64 on the CPU.  The baseline
+    is the same operator in float32, which is what a correct kernel on this
+    device would achieve.  The number reported is the substitute's error.
+    """
+    native = getattr(torch, name, None)
+    if native is None or name not in REGIMES:
+        return None
+    worst = {"error": 0.0, "regime": None, "baseline": 0.0}
+    for label, lo, hi, logspace in REGIMES[name]:
+        try:
+            x = (torch.logspace(lo, hi, 1024) if logspace
+                 else torch.linspace(lo, hi, 1024)).float()
+            if name == "asinh" and logspace:
+                x = -x
+            exact = native(x.double())
+            base = native(x)
+            got = impl(x.to(dev)).to("cpu")
+            m = exact.abs() > 0
+            if not bool(m.any()):
+                continue
+            err = float(((got.double()[m] - exact[m]).abs() / exact[m].abs()).max())
+            bas = float(((base.double()[m] - exact[m]).abs() / exact[m].abs()).max())
+            if err != err or err > worst["error"]:
+                worst = {"error": err, "regime": label, "baseline": bas}
+        except Exception:
+            continue
+    return worst if worst["regime"] else None
+
+
 def _rewrites(torch):
     F = torch.nn.functional
+    stable = _stable(torch)
 
     def std(x, *a, **k):
         unbiased = k.pop("unbiased", True)
@@ -136,20 +228,19 @@ def _rewrites(torch):
             torch.return_types, "kthvalue") else (v, i)
 
     return {
-        "log1p": lambda x: torch.log(1.0 + x),
-        "expm1": lambda x: torch.exp(x) - 1.0,
+        "log1p": stable["log1p"],
+        "expm1": stable["expm1"],
         "exp2": lambda x: torch.exp(x * LN2),
-        "sinh": lambda x: (torch.exp(x) - torch.exp(-x)) * 0.5,
-        "cosh": lambda x: (torch.exp(x) + torch.exp(-x)) * 0.5,
+        "sinh": stable["sinh"],
+        "cosh": stable["cosh"],
         "asin": lambda x: torch.atan2(x, torch.sqrt((1.0 - x * x).clamp(min=0))),
         "arcsin": lambda x: torch.atan2(x, torch.sqrt((1.0 - x * x).clamp(min=0))),
-        "asinh": lambda x: torch.log(x + torch.sqrt(x * x + 1.0)),
-        "arcsinh": lambda x: torch.log(x + torch.sqrt(x * x + 1.0)),
+        "asinh": stable["asinh"],
+        "arcsinh": stable["asinh"],
         "acosh": lambda x: torch.log(x + torch.sqrt((x * x - 1.0).clamp(min=0))),
         "arccosh": lambda x: torch.log(x + torch.sqrt((x * x - 1.0).clamp(min=0))),
-        "atanh": lambda x: 0.5 * torch.log((1.0 + x) / (1.0 - x)),
-        "arctanh": lambda x: 0.5 * torch.log((1.0 + x) / (1.0 - x)),
-        "erfc": lambda x: 1.0 - torch.erf(x),
+        "atanh": stable["atanh"],
+        "arctanh": stable["atanh"],
         "logit": lambda x, eps=None: torch.log(
             (x.clamp(eps, 1 - eps) if eps is not None else x) /
             (1.0 - (x.clamp(eps, 1 - eps) if eps is not None else x))),
@@ -288,9 +379,39 @@ def activate(backend=None, verbose=False):
     corrections = _corrections(torch)
     checks = _checks(torch)
 
-    def install(name, impl, strategy, reason):
+    def cpu_fallback(original, name):
+        def run(*args, **kwargs):
+            moved = tuple(a.detach().to("cpu") if hasattr(a, "device") else a
+                          for a in args)
+            kw = {k: (v.detach().to("cpu") if hasattr(v, "device") else v)
+                  for k, v in kwargs.items()}
+            out = original(*moved, **kw)
+            back = args[0].device if args and hasattr(args[0], "device") else dev
+            if hasattr(out, "to"):
+                return out.to(back)
+            if isinstance(out, tuple):
+                return tuple(o.to(back) if hasattr(o, "to") else o for o in out)
+            return out
+        return run
+
+    # A rewrite is only worth using if it is accurate.  Above this, the answer
+    # is wrong in a way no caller would detect, which is the fault this tool
+    # exists to find, and shipping it would make us the thing we are measuring.
+    UNUSABLE = 1e-4
+
+    def install(name, impl, strategy, reason, original=None):
         holder, attr = _resolve(torch, name)
-        ledger.decide(name, strategy, reason)
+        accuracy = measure(attr, impl, torch, dev) if strategy == "rewrite" else None
+        if (strategy == "rewrite" and accuracy and original is not None
+                and (accuracy["error"] != accuracy["error"]
+                     or accuracy["error"] > UNUSABLE)):
+            # The arrangement is right; the primitives it is built from are not.
+            strategy = "fallback"
+            reason = ("rewritten form measures %.1e %s, where a correct kernel "
+                      "reaches %.1e, so it is computed on the CPU"
+                      % (accuracy["error"], accuracy["regime"], accuracy["baseline"]))
+            impl = cpu_fallback(original, name)
+        ledger.decide(name, strategy, reason, accuracy)
 
         def patched(*args, **kwargs):
             start = time.time()
@@ -309,22 +430,12 @@ def activate(backend=None, verbose=False):
             except (TypeError, AttributeError):
                 pass
         if verbose:
-            print("    %-18s %-9s %s" % (name, strategy, reason))
-
-    def cpu_fallback(original, name):
-        def run(*args, **kwargs):
-            moved = tuple(a.detach().to("cpu") if hasattr(a, "device") else a
-                          for a in args)
-            kw = {k: (v.detach().to("cpu") if hasattr(v, "device") else v)
-                  for k, v in kwargs.items()}
-            out = original(*moved, **kw)
-            back = args[0].device if args and hasattr(args[0], "device") else dev
-            if hasattr(out, "to"):
-                return out.to(back)
-            if isinstance(out, tuple):
-                return tuple(o.to(back) if hasattr(o, "to") else o for o in out)
-            return out
-        return run
+            tail = ""
+            if accuracy:
+                tail = ("   error %.1e vs %.1e for a proper kernel (%s)"
+                        % (accuracy["error"], accuracy["baseline"],
+                           accuracy["regime"]))
+            print("    %-18s %-9s %s%s" % (name, strategy, reason, tail))
 
     # 1. Operators that are simply absent.
     for name, impl in rewrites.items():
@@ -349,7 +460,8 @@ def activate(backend=None, verbose=False):
                 continue
             install(name, impl, "rewrite",
                     "no kernel on this device" if missing
-                    else "device kernel fails: %s" % text[:60])
+                    else "device kernel fails: %s" % text[:60],
+                    original=fn)
 
     # 2. Operators that are present and wrong.
     for name, check in checks.items():

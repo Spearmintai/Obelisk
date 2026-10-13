@@ -6,3 +6,6 @@ build/
 *.obl
 result*.json
 report*.html
+pypi.env
+*.env
+.env
