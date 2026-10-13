@@ -2,335 +2,167 @@
 
 **Your code runs on the new accelerator. That is not the same as running correctly.**
 
-Moving a model from one accelerator to another is usually declared finished when
-the program stops crashing. Nothing checks the part that matters: whether the
-numbers coming out are still the numbers that came out before. There is no
-baseline to check them against, so "it ran" becomes the whole verdict.
+[![PyPI](https://img.shields.io/pypi/v/obelisk-env)](https://pypi.org/project/obelisk-env/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://pypi.org/project/obelisk-env/)
 
-Obelisk supplies the missing baseline. It measures a reference device, writes the
-measurements to a small file, carries that file to the target device, and reports
-every place the two disagree, how far apart they are, and which hardware
-assumption is responsible.
+[中文](README.zh-CN.md)
 
 ```
-pip install obelisk-ai
+pip install obelisk-env
 ```
 
-## The shortest version
+---
 
-Run the same two lines on two machines.
+## 1. The problem
 
-```
-$ obe sample          # on the NVIDIA box          $ obe sample          # on the domestic card
+Run the same two lines on two machines. Same seed, same code, same version of PyTorch.
 
-  device   NVIDIA GeForce RTX 4090                   device   MTT S4000
-  torch    2.2.0+cu121                               torch    2.2.0
+| | NVIDIA RTX 4090 | Moore Threads MTT S4000 |
+|---|---|---|
+| `rand` (uniform) | +0.51667917 | +0.51667917 |
+| `randn` (normal) | −0.42534423 | −0.4253**4396** |
+| `log1p` | +0.69314718 | `NotImplementedError` |
 
-  rand (uniform)   +0.39904648 +0.51667917           rand (uniform)   +0.39904648 +0.51667917
-  randn (normal)   -0.92466241 -0.42534423           randn (normal)   -0.92466241 -0.42534396
-  log1p            +0.69314718 +1.09861231           log1p            NotImplementedError
-  digamma          -0.57721591 +0.42278421           digamma          NotImplementedError
-```
+The uniform random stream matches bit for bit, so the generator was ported correctly. Everything downstream of it is another matter.
 
-Same seed, same code, same version of PyTorch. The uniform random stream matches
-bit for bit. The normal one does not. Three library functions are missing
-outright. Nothing here raised a warning on the way to that difference, and
-nothing in either program would have told you.
+Then there is this, which is worse because nothing breaks. `SELU` is a standard activation function that multiplies positive inputs by 1.0507.
 
-## The full version
+| computed by | result | error |
+|---|---|---|
+| the closed-form definition, in float64 | 3.216856 | — |
+| CPU | 3.216856 | 1.2e−07 |
+| RTX 4090 | 3.216856 | 1.2e−07 |
+| **MTT S4000** | **3.061628** | **4.8e−02** |
 
-```
-# on the reference machine
-obe record --out reference.obl
+No exception, no warning, no degraded mode. A model built on SELU trains on this card, produces a loss curve, converges, and is wrong by five percent in every positive activation.
 
-# copy reference.obl to the target machine — it is a small text file and it is
-# everything the target needs
+This is the gap the industry does not measure. There are many tools for *will it run*. There is nothing for *is it right*. And a buyer signing for a hundred million yuan of compute needs the second one.
 
-# on the target machine
-obe verify --ref reference.obl --html report.html
-```
+## 2. The product
 
-```
-  ENVIRONMENT ALIGNMENT REPORT                                     GRADE  D
+Three questions, each needing less access than the last.
 
-  reference   NVIDIA GeForce RTX 4090   (cuda, torch 2.2.0+cu121)
-  target      MTT S4000                 (musa, torch 2.2.0)
+| question | what it needs | size | who gets it |
+|---|---|---|---|
+| **Will my code run?** | operator and dtype support lists | 3 KB | publishable |
+| **Will it run correctly?** | numerical fingerprints | 562 KB | the buyer |
+| **What did it actually do?** | the substitution ledger | at runtime | the operator |
 
-  ASSUMPTIONS
-   x  lib.transcendental    Transcendental functions   ERROR      aten::log1p is missing
-   !  acc.fp16_accumulate   Half-precision accumulator DIVERGENT  3.37e-04
-   !  ord.atomics           Atomic accumulation order  DIVERGENT  2.40e-03
-   !  lib.normalisation     Normalisation epsilon      DIVERGENT  1.32e-05
-   !  rng.device_stream     Device random stream       NOT_BITWISE
-   !  sel.tie_breaking      Tie breaking in sort/topk  NOT_BITWISE
-   ~  acc.fp32_matmul       float32 matmul precision   WITHIN_TOLERANCE
-        error_vs_exact       reference 2.93e-05   target 9.49e-05
-        mantissa_bits        reference 21.7       target 20.0
-```
+The method rests on four decisions.
 
-The last two lines are a measurement rather than an accusation. Both devices are
-compared against the same product computed exactly in float64 on the CPU, a
-yardstick that belongs to neither of them, so each one's precision can be stated
-on its own terms.
-
-## The whole device, not just the fifteen questions
-
-`obe record` measures the assumptions a workload depends on. `obe dump` measures
-the device itself: every operator PyTorch exposes, every data type, and the
-probes. The method rests on one decision. The CPU is the oracle for whether a
-call is *valid*, and the device is the subject. Every case runs on the CPU first;
-if it fails there, the harness called it wrong and the case is discarded rather
-than counted against the device. Only a call the CPU accepts and the device
-refuses is a finding.
+- **The CPU is the oracle for validity; the device is the subject.** Every case runs on the CPU first. If it fails there, the harness called it wrong and the case is discarded rather than counted against the device.
+- **A fingerprint is a digest, float64 statistics, and 512 deterministic samples.** Small enough to travel in a text file, rich enough to compare elementwise with neither tensor present.
+- **Error is measured against the scale of the tensor,** not elementwise. Two values of 1e-41 that differ by 1e-41 are a hundred percent apart and both of them are zero.
+- **Quantities with no excuse to differ are held to bitwise equality:** a random stream, the order of a sort. Arithmetic only has to be close.
 
 ```
-obe dump --out card.obl        # on each card, once
-obe diff a.obl b.obl           # anywhere, with no hardware present
+obe sample     print a few numbers; run it on two machines and read them side by side
+obe dump       profile a device completely: every operator, every dtype, 15 probes
+obe diff       compare two profiles, with no hardware present
+obe cards      the devices this copy already knows about
+obe check      judge a repository against a card profiled somewhere else
+obe run        run a program with the gaps filled in, and report every substitution
+obe record     measure a reference for one workload
+obe verify     compare this device against a recorded reference
+obe inspect    read a repository and predict its risk, before any card exists
+obe migrate    rewrite for another backend, and report what it could not change
 ```
 
-Measured on an RTX 4090 against a Moore Threads MTT S4000, both on torch 2.2.0.
-Seven hundred callables discovered, 399 valid on the CPU and run on both:
+## 3. The demonstration
+
+**Thirty seconds.** One command on each machine, then read the two outputs side by side.
 
 ```
-  OPERATOR COVERAGE  (399 operators run on both)
-   behave the same                    272
-   numerically different              20
-   unavailable on the target          105  (73 distinct operations)
-
-  WORKS ON THE REFERENCE, NOT ON THE TARGET
-   x  std      median    svd       qr        cholesky  det       logdet
-   x  asin     asinh     acosh     atanh     sinh      cosh      log1p
-   x  lgamma   digamma   erfc      exp2      hypot     nansum    kthvalue
-      and 52 more
-
-  RUNS ON BOTH, RETURNS A DIFFERENT ANSWER
-   !  torch.selu                         MISMATCH   4.83e-02
-   !  torch.vander                       MISMATCH   1.00e+00
-   !  torch.max_pool1d_with_indices      SHAPE
+obe sample
 ```
 
-SELU multiplies positive inputs by 1.0507. On that card it returns them
-unchanged, so every positive activation is five percent low, the negative branch
-is correct, and nothing raises. A model built on it trains, converges, and is
-wrong. That is the case no amount of running the program would have found.
+**The full version, where the card and the code never meet.** This is the arrangement the work actually takes: the code is on a laptop, the card is in a machine room with no route out, and nobody has put one on the other.
 
-Each profile carries a digest over everything it asserts, and a comparison cites
-the digests it was built from, so a report can be checked against the
-measurements it came from and a withdrawn measurement can be named exactly.
+```
+# on the card, with none of your code present
+obe dump --out s4000.obl
 
-Profiles accumulate. Ten cards is ten hardware sessions and forty-five pairings,
-and every pairing after the first is a file read.
+# one file, under a megabyte, carried by whatever means the machine room allows
+scp s4000.obl laptop:
 
-## Making it run, and saying what that cost
+# on a box with no accelerator and no PyTorch installed
+obe check ./your-repo --card s4000.obl
+```
 
-A missing operator is rarely a missing capability. log1p is log(1+x), asinh is a
-logarithm and a square root, a standard deviation is the square root of a
-variance. The hardware can nearly always do the work; what it lacks is someone to
-write the arrangement down.
+```
+  CODE AGAINST CARD                                              GRADE  C
+
+  7 operations certainly and 1 probably would fail here,
+  and every one can be substituted.
+
+   x  torch.slogdet    4 call sites   normflows/flows/mixing.py:117
+   x  torch.std        3 call sites   normflows/flows/normalization.py:23
+   x  F.logsigmoid     2 call sites   normflows/transforms.py:29
+   x  torch.qr         2 call sites   normflows/flows/mixing.py:73
+```
+
+Nobody bought a card, nobody shipped code into a machine room, nobody waited for a slot.
+
+**Then make it run anyway, and say what that cost.**
 
 ```
 obe run train.py
 ```
 
-patches what the device cannot do and runs the program. Three kinds of
-substitution, and every one of them recorded:
-
-| | |
-|---|---|
-| rewrite | expressed in operators the device does have, still on the device |
-| fallback | computed on the CPU, which is correct and slow, and the ledger says how slow |
-| correct | the device has the operator, and the operator is wrong |
-
-On the MTT S4000 an ordinary piece of scientific PyTorch dies at line 11 with
-`aten::std.correction`. Under `obe run` it completes, having stood in for 66
-operators, and finishes with this:
+A missing operator is rarely a missing capability. `log1p` is `log(1+x)`; a standard deviation is the square root of a variance. Obelisk fills them in three ways and records every one: **rewritten** in operators the device does have, sent back to the **CPU**, or **corrected** because the device's own kernel is wrong.
 
 ```
   LEDGER: what did not happen the way you wrote it
 
-   operator                 how            calls    seconds
-   selu                     correct            2      0.000
-   slogdet                  fallback           1      0.001
-   std                      rewrite            1      0.000
-   median                   rewrite            1      0.054
-   ...
-   10 call(s) through 9 substituted operator(s), 0.056 s total
-   0.001 s of that was spent moving data to the CPU and back
-   selu was called 2 time(s); the device kernel is wrong, so the result you
+   operator      how          calls   seconds    accuracy
+   selu          correct          2     0.000       exact
+   slogdet       fallback         1     0.001       exact
+   std           rewrite          1     0.000       exact
+   log1p         fallback         1     0.008     3.1e-01
+
+   selu was called 2 times; the device kernel is wrong, so the result you
    got is not the result the device would have given
 ```
 
-The point is not that the program stopped crashing. Anything can stop a program
-crashing. The point is the last line, which a silent compatibility layer would
-never tell you.
+The point is not that the program stopped crashing. Anything can stop a program crashing. The point is the last line, which a silent compatibility layer would never tell you.
 
-## The card library
+## 4. The validation
 
-Obelisk ships with a capability card for every device that has been measured, so
-you can check your code against hardware you do not own.
+Measured on 12 October 2026, on two rented machines, with PyTorch 2.2.0 on both sides so the framework version is not part of the difference.
 
-```
-$ obe cards
+**Operator coverage.** Seven hundred callables discovered by introspection; 399 accepted by the CPU and put to both cards.
 
-  2 device(s) measured and shipped with this copy of Obelisk
+| | RTX 4090 | MTT S4000 |
+|---|---|---|
+| behave the same | 386 | 272 |
+| return a different answer | 10 | 20 |
+| **do not exist** | **1** | **73 distinct operations** |
 
-  card                     backend    missing   wrong      ok
-  mtt-s4000-musa           musa           108      13     278
-  rtx-4090-cuda            cuda             3      10     386
+Absent on the domestic card, among others: `std`, `median`, `svd`, `qr`, `cholesky`, `det`, `logdet`, `slogdet`, `lu`, `triangular_solve`, `cdist`, `pdist`, `asin`, `asinh`, `acosh`, `atanh`, `sinh`, `cosh`, `log1p`, `exp2`, `erfc`, `lgamma`, `digamma`, `i0`, `nansum`, `nanmean`, `kthvalue`, `logaddexp`, `logsigmoid`, `mish`.
 
-$ obe check ./my-repo --card mtt-s4000-musa
-```
+**Wrong answers, raised silently.** `SELU` low by 5%. `torch.log` wrong by 30.7% at 1+2⁻²³, 4.0% at 1+2⁻²⁰, and accurate to 2.9e−08 at 1.5, which poisons any log-likelihood landing near one. `vander` wrong by 100%. `max_pool1d_with_indices` returns a different shape.
 
-A full profile is most of a megabyte, because it carries the numerical
-fingerprints needed to answer whether your code runs *correctly*. The question
-of whether it runs at all needs far less: which operators work, which do not,
-and which data types can compute. That reduces to about three kilobytes, which
-is small enough to ship.
+**Data types.** float64 allocates and sums but cannot add or multiply. complex64 cannot allocate at all.
 
-A card is only true of the configuration it was measured on. A driver update or
-a framework upgrade can add or remove kernels, so every card records the
-versions it was taken under and `obe check` prints them. A stale card is worse
-than no card, because it is believed.
+**Assumptions.** Of fifteen probes, three diverge beyond tolerance: half-precision accumulator width at 3.37e−04, layer_norm epsilon at 1.32e−05, scatter-add ordering at 4.33e−03. Two that should match exactly do not: the random stream, where the uniform draw is bit-identical and the normal transform is not, and tie-breaking in sort, topk and argmax.
 
-To add your own hardware, measure it once and reduce it:
+**One measurement in the card's favour.** float32 matmul carries 20.0 effective mantissa bits against 21.7 on the 4090, measured against the same product computed exactly in float64 on a CPU. A shortened float32 would show 11. Neither card is cheating, and the measurement says so in a form anyone can repeat.
 
-```
-obe dump --out card.obl
-obe cards --profile card.obl
-```
+**And the honest negative, which is what makes the rest believable.** A four-layer transformer ran on both cards with identical weights and batches: 28 of 28 layers inside tolerance, final loss after fifty steps 3.73e−09 apart, parameters 5.36e−09 apart. This workload touches none of the broken parts. It is fine on this card. Naming which workloads are affected and which are not is the whole job; a report that only ever says no is not worth reading.
 
-## When the card and the code are in different places
+**We ran the same scrutiny over our own instrument.** The first set of substitutes committed the exact fault this tool exists to catch: `log(1+x)` returns zero for small x, so our `log1p` was wrong by 100% and silent. They are now written the way a library writes them, and every substitute measures itself at startup against the operator in float64, refusing to install if it is worse than 1e−4. That rule immediately earned its place: the corrected `log1p` still measured 3.1e−01 on the S4000, while the identical code on a CPU measures 1.2e−07 and on a 4090 matches the CPU bit for bit. The formula was right. The card's logarithm was not. That is how the `log` defect above was found.
 
-They almost always are. The code is on a laptop or a build server; the card is in
-a machine room with no route out, and nobody has put the code on it yet. That is
-exactly why nobody checks.
+## 5. Where it stands
 
-```
-obe dump --out s4000.obl              # on the card, with none of your code present
-scp s4000.obl laptop:                 # one file, under a megabyte
-obe check ./repo --card s4000.obl     # on a box with no accelerator and no torch
-```
+- **On PyPI.** `pip install obelisk-env`, installs into an empty environment, no dependencies.
+- **Tested against seven real repositories**, including diffusers at 2,125 Python files, read in about a second with no accelerator and no PyTorch.
+- **Two devices in the card library**, shipped inside the package, so `obe check ./repo --card mtt-s4000-musa` works with no file at all.
+- **The three-machine workflow is proven end to end**: card profiled alone, file carried, verdict produced on a box with no GPU.
 
-```
-  CODE AGAINST CARD                                               GRADE  C
+### Boundaries
 
-  code   ./normalizing-flows  (71 python files)
-  card   MTT S4000  (musa)
-
-  7 operations this code calls would fail here, and all of them can be substituted.
-
-  WILL NOT RUN
-   x  torch.slogdet         MISSING   obe can run it on the CPU   4 call sites
-        normflows/flows/mixing.py:117
-   x  torch.std             MISSING   obe can rewrite it          3 call sites
-        normflows/flows/normalization.py:23
-   x  F.logsigmoid          MISSING   obe can rewrite it          2 call sites
-   x  torch.qr              MISSING   obe can run it on the CPU   2 call sites
-```
-
-Nobody bought anything, nobody shipped code into a machine room, and nobody
-waited for a slot on a card.
-
-## What it checks
-
-Fifteen probes, each isolating one assumption that programs make about their
-accelerator and never write down.
-
-| group | assumption |
-|---|---|
-| accumulation | summation order, half-precision accumulator width |
-| precision | float32 matmul precision, bfloat16 support |
-| math library | transcendental functions, softmax numerics, normalisation epsilon |
-| parallel ordering | atomic accumulation order, run-to-run stability, reduction over awkward shapes |
-| randomness | the device random stream |
-| selection | tie breaking in sort, topk and argmax |
-| fused kernels | scaled dot-product attention, convolution |
-| memory | layout and striding |
-
-Then the same questions are asked of a real transformer: every layer of a forward
-pass, and the loss and parameters across fifty training steps.
-
-## How a difference becomes an explanation
-
-A layer that disagrees is a symptom. The probe that disagrees in the same way is
-the cause. When a layer diverges, Obelisk names the probes that could explain it
-and that are themselves failing, so the report ends with sentences like *this
-normalisation layer diverges, and the normalisation epsilon probe is also
-diverging* rather than a wall of numbers.
-
-## Grades
-
-| | |
-|---|---|
-| **A** | bit-identical throughout |
-| **B** | differs, but every difference is inside the tolerance for its dtype |
-| **C** | at least one assumption is broken; usable with care |
-| **D** | a critical assumption is broken, or an operation is missing |
-| **E** | the device does not agree with itself |
-
-## Commands
-
-| | |
-|---|---|
-| `obe sample` | print a few numbers; run it on two machines and read them side by side |
-| `obe run` | run a program with the gaps filled in, and report every substitution |
-| `obe check` | judge a repository against a card profiled somewhere else |
-| `obe dump` | profile this device completely: operators, dtypes, probes |
-| `obe diff a.obl b.obl` | compare two profiles with no hardware present |
-| `obe record` | measure the reference for one workload |
-| `obe verify --ref` | compare this device against a recorded reference |
-| `obe inspect` | read a repository and predict its risk, before any card exists |
-| `obe migrate` | rewrite for another backend, and report what it could not change |
-| `obe probes` | list the assumptions Obelisk knows how to test |
-| `obe devices` | list the accelerators visible here |
-
-A grade is never the whole answer, and the report says what drove it.
-
-## Before you have a card
-
-```
-obe inspect ./your-repo
-```
-
-reads the source and predicts the risk from the assumptions written into it:
-device names, pinned backends, hand-written kernels, precision flags,
-order-dependent accumulations. On nanoGPT it finds 81 of them and returns a
-predicted grade of C. The prediction is written down before the run, so it can
-be held against the result afterwards.
-
-```
-obe migrate ./your-repo --target musa --patch port.diff
-```
-
-rewrites the mechanical part and, more usefully, reports what it could not safely
-change, including every place the old backend is still named after the rewrite.
-
-## Why the blueprint is a text file
-
-Reference and target are usually not the same machine, and the interesting one
-usually has no network. A blueprint is about a megabyte of JSON. It travels on a
-USB stick, it can be opened and read by a person, and it carries enough of each
-tensor — a digest, summary statistics, and a deterministic sample of the values —
-that the two sides can be compared elementwise without either tensor ever being
-in the same room as the other.
-
-Nothing of your code or your data goes into it. Obelisk measures the device, not
-the workload you are protecting.
-
-## Tolerance
-
-The headline number for every comparison is the largest absolute disagreement
-divided by the size of the largest value in the reference. Relative error on its
-own is unusable here: two values of 1e-41 that differ by 1e-41 are a hundred
-percent apart and both of them are zero.
-
-Quantities that have no excuse to differ at all — a random stream, the order of a
-sort — are held to a stricter standard and must match exactly.
-
-## Supported backends
-
-CUDA, MUSA (Moore Threads), and CPU. A backend is three small methods; adding one
-does not touch anything else.
+Everything measured here is specific to one Moore Threads MTT S4000 under driver 2.7.0 and torch 2.2.0. No Ascend, Cambricon or Iluvatar card has been tested. A card is only true of the configuration it was measured on, which is why every card records its driver and framework versions and `obe check` prints them. A stale card is worse than no card, because it is believed.
 
 ## License
 

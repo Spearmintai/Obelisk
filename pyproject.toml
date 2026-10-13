@@ -30,6 +30,11 @@ dependencies = []
 [project.optional-dependencies]
 torch = ["torch"]
 
+[project.urls]
+Homepage = "https://github.com/Spearmintai/Obelisk"
+Source = "https://github.com/Spearmintai/Obelisk"
+Issues = "https://github.com/Spearmintai/Obelisk/issues"
+
 [project.scripts]
 obe = "obelisk.cli:main"
 
